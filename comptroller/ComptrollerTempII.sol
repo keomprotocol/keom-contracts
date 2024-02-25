@@ -17,7 +17,7 @@ interface IUnitroller {
  * @author  KEOM Protocol
  * @notice Based on Compound's Comptroller with some changes inspired by BENQi.fi
  */
-contract Comptroller is
+contract ComptrollerTempII is
     ComptrollerV9Storage,
     ComptrollerErrorReporter,
     ExponentialNoError
@@ -109,6 +109,12 @@ contract Comptroller is
     }
 
     /*** Assets You Are In ***/
+
+
+    function fixAccountsAssetsIn(address account, IKToken[] calldata kTokens) external {
+        require(msg.sender == admin, "");
+        accountAssets[account] = kTokens;
+    }
 
     /**
      * @notice Returns the assets an account has entered
