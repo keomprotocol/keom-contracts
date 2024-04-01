@@ -9,11 +9,14 @@ import "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 import { IApi3Server } from "./Api3/interfaces/IApi3Server.sol";
 import "./chainlink/interfaces/IAggregatorV2V3.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "./LayerBank/interfaces/LayerBankAdapter.sol";
 
 enum OracleProviderType {
     Chainlink,
     Pyth,
-    Api3
+    Api3,
+    RedStone,
+    LayerBank
 }
 
 struct OracleProvider {
@@ -24,6 +27,8 @@ struct OracleProvider {
 struct FeedData {
     ///@dev required by Chainlink
     address feedAddress; 
+    ///@dev required by LayerBank
+    address underlyingAsset; 
     ///@dev required by Pyth and API3 
     bytes32 feedId;
     uint256 heartbeat;
@@ -41,14 +46,16 @@ contract KeomOracleAggregator is Ownable, PriceOracle {
 
     //************ * ฅ^•ﻌ•^ฅ  𝑬𝑽𝑬𝑵𝑻𝑺  ฅ^•ﻌ•^ฅ * ************//
 
-    event FeedUpdated(address kToken, address feedAddress, bytes32 feedId, uint256 heartbeat);
-    event FallbackFeedUpdated(address kToken, address feedAddress, bytes32 feedId, uint256 heartbeat);
+    event FeedUpdated(address kToken, address underlyingAsset, address feedAddress, bytes32 feedId, uint256 heartbeat);
+    event FallbackFeedUpdated(address kToken, address underlyingAsset, address feedAddress, bytes32 feedId, uint256 heartbeat);
     event PricesUpdated();
 
     //************ * ฅ^•ﻌ•^ฅ  CONSTRUCTOR  ฅ^•ﻌ•^ฅ * ************//
 
-    constructor(address _pyth, address _api3Server) Ownable() {
-        oracleProviders[OracleProviderType.Chainlink] = OracleProvider(address(0), _getChainlinkPrice);
+    constructor(address _pyth, address _api3Server,  address _layerBankRedStoneOracle) Ownable() {
+        oracleProviders[OracleProviderType.Chainlink] = OracleProvider(address(0), _getChainlinkOrRedStonePrice);
+        oracleProviders[OracleProviderType.RedStone] = OracleProvider(address(0), _getChainlinkOrRedStonePrice);
+        oracleProviders[OracleProviderType.LayerBank] = OracleProvider(_layerBankRedStoneOracle, _getLayerBankPrice);
         oracleProviders[OracleProviderType.Pyth] = OracleProvider(_pyth, _getPythPrice);
         oracleProviders[OracleProviderType.Api3] = OracleProvider(_api3Server, _getApi3Price);
     }
@@ -111,23 +118,28 @@ contract KeomOracleAggregator is Ownable, PriceOracle {
         OracleProviderType _oracleType,
         bool isFallback
     ) external onlyOwner {
-        if (_oracleType == OracleProviderType.Chainlink) {
+        if (_oracleType == OracleProviderType.Chainlink || _oracleType == OracleProviderType.RedStone) {
             require(_feedId == bytes32(0) && _feedAddress != address(0), "Invalid feed");
         }
         else if (_oracleType == OracleProviderType.Pyth || _oracleType == OracleProviderType.Api3) {
             require(_feedId != bytes32(0) && _feedAddress == address(0), "invalid feed");
         }
+        else if (_oracleType == OracleProviderType.LayerBank) {
+            require(_feedId == bytes32(0) && _feedAddress == address(0), "Invalid feed");
+        }
         else {
             revert("Unsupported oracle type");
         }
+
+        address _undelyingAsset = getUnderlyingAsset(_kToken);
         
         if (!isFallback) {
-            feeds[_kToken] = FeedData(_feedAddress, _feedId, _heartbeat, _oracleType, true);
-            emit FeedUpdated(_kToken, _feedAddress, _feedId, _heartbeat);
+            feeds[_kToken] = FeedData(_feedAddress, _undelyingAsset,  _feedId, _heartbeat, _oracleType, true);
+            emit FeedUpdated(_kToken, _feedAddress, _undelyingAsset,  _feedId, _heartbeat);
         }
         else {
-            fallbackFeeds[_kToken] = FeedData(_feedAddress, _feedId, _heartbeat, _oracleType, true);
-            emit FallbackFeedUpdated(_kToken, _feedAddress, _feedId, _heartbeat);
+            fallbackFeeds[_kToken] = FeedData(_feedAddress, _undelyingAsset,  _feedId, _heartbeat, _oracleType, true);
+            emit FallbackFeedUpdated(_kToken, _feedAddress, _undelyingAsset,  _feedId, _heartbeat);
         }
     }
 
@@ -136,7 +148,7 @@ contract KeomOracleAggregator is Ownable, PriceOracle {
     /// @notice return price of an kToken from Chainlink
     /// @param feed contains feed address required by Chainlink
     /// @return price with 18 decimals
-    function _getChainlinkPrice(FeedData memory feed) internal view returns (bool, uint256)
+    function _getChainlinkOrRedStonePrice(FeedData memory feed) internal view returns (bool, uint256)
     {
         IAggregatorV2V3 chainlinkAggregator = IAggregatorV2V3(feed.feedAddress);
 
@@ -176,7 +188,29 @@ contract KeomOracleAggregator is Ownable, PriceOracle {
             (false, 0);
     }
 
+    /// @notice return price of an kToken from LayerBank on Manta
+    /// @param feed contains feedId required by LayerBank on Manta
+    /// @return price with 18 decimals
+    function _getLayerBankPrice(FeedData memory feed) internal view returns (bool, uint256) {
+        LayerBankAdapter layerBankOracle = LayerBankAdapter(oracleProviders[OracleProviderType.LayerBank].oracleProviderAddress);
+        uint256 lastUpdatedAt = layerBankOracle.getBlockTimestampFromLatestUpdate();
+        uint256 price = feed.underlyingAsset == address(0)
+            ? layerBankOracle.priceOfETH()
+            : layerBankOracle.priceOf(feed.underlyingAsset);
+        return block.timestamp < lastUpdatedAt + feed.heartbeat
+            ? (true, price)
+            : (false, 0);
+    }
+
     //************ * ฅ^•ﻌ•^ฅ  UTILS  ฅ^•ﻌ•^ฅ * ************//
+
+    function getUnderlyingAsset(address kToken) internal view returns(address) {
+        try KErc20(kToken).underlying() returns (address underlyingAddress) { 
+            return underlyingAddress;
+        } catch {
+            return address(0);
+        }
+    }
 
     function _abs(int256 x) internal pure returns (uint256) {
         return uint256(x < 0 ? -x : x);
